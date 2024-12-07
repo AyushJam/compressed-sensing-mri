@@ -1,7 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.fft import fft2, ifft2, fftshift, ifftshift
-import scipy.io
 from skimage.data import shepp_logan_phantom
 from skimage.transform import resize
 from skimage.metrics import structural_similarity as ssim
@@ -36,7 +35,8 @@ def wavelet_threshold(img, wavelet='db4', level=4, lam=0.01):
             thresh_coeffs.append(tuple(soft_threshold(ci, lam) for ci in c))
         else:
             thresh_coeffs.append(soft_threshold(c, lam))
-    return pywt.waverec2(thresh_coeffs, wavelet=wavelet)
+    rec = pywt.waverec2(thresh_coeffs, wavelet=wavelet)
+    return rec
 
 def total_variation_gradient(img):
     dx = np.roll(img, -1, axis=1) - img
@@ -56,6 +56,15 @@ def psnr_metric(x, ref):
     max_val = np.max(ref)
     return 20 * np.log10(max_val / np.sqrt(mse_val))
 
+# For uniform figure sizing
+def plot_and_save(img, title, path):
+    fig = plt.figure(figsize=(6,6))
+    plt.imshow(img, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+    plt.savefig(path)
+    plt.close(fig)
+
 # ============================================================
 # Sampling Masks
 # ============================================================
@@ -71,7 +80,7 @@ def mask_variable_density(size, center_fraction=0.08, prob=0.3):
     center_size = int(Ny * center_fraction)
     center_start = Ny//2 - center_size//2
     center_end = center_start + center_size
-    mask[center_start:center_end, :] = 1
+    mask[center_start:center_end, center_start:center_end] = 1
     random_mask = np.random.rand(Ny, Nx) < prob
     mask = np.logical_or(mask, random_mask)
     return mask.astype(float)
@@ -92,9 +101,49 @@ def mask_radial(size, num_spokes=30):
     return mask
 
 def mask_random_incoherent(size, sampling_rate=0.3):
-    # Pure random sampling of k-space points with given probability
     Ny, Nx = size
     mask = (np.random.rand(Ny, Nx) < sampling_rate).astype(float)
+    return mask
+
+def mask_density_weighted(size, fraction=0.3):
+    # Density weighted: use a Gaussian centered at the center of k-space
+    Ny, Nx = size
+    y, x = np.indices((Ny, Nx))
+    cy, cx = Ny//2, Nx//2
+    sigma = Ny/4.0
+    gauss = np.exp(-((x - cx)**2 + (y - cy)**2)/(2*sigma**2))
+    gauss = gauss / np.sum(gauss)
+    # Now select points with probability proportional to gauss until fraction reached
+    flat = gauss.flatten()
+    num_points = int(fraction * Ny * Nx)
+    chosen_indices = np.random.choice(Ny*Nx, size=num_points, p=flat, replace=False)
+    mask = np.zeros((Ny, Nx))
+    mask.flat[chosen_indices] = 1
+    return mask
+
+def mask_spiral(size, fraction=0.3):
+    # Approximate a spiral pattern by choosing points along an Archimedean spiral
+    Ny, Nx = size
+    num_points = int(fraction * Ny * Nx)
+    mask = np.zeros((Ny, Nx))
+    center = (Ny//2, Nx//2)
+    # Archimedean spiral: r = a*t, x = r*cos(t), y=r*sin(t)
+    # choose 'a' to fill about half the radius at max points
+    # We'll just try a fixed increment and break early
+    a = 0.1
+    t = 0.0
+    count = 0
+    while count < num_points:
+        r = a * t
+        x = int(center[1] + r * np.cos(t))
+        y = int(center[0] + r * np.sin(t))
+        if 0 <= x < Nx and 0 <= y < Ny:
+            if mask[y, x] == 0:
+                mask[y, x] = 1
+                count += 1
+        t += 0.5
+        if r > Nx:  # break if spiral goes out of the image bounds
+            break
     return mask
 
 # ============================================================
@@ -112,16 +161,16 @@ def iterative_recon_wavelet(undersampled_k, mask, outdir, original, max_iter=50,
         ksp_rec = fft2c(rec)
         ksp_rec = undersampled_k + (1 - mask)*ksp_rec
         rec = np.abs(ifft2c(ksp_rec))
+
         # Wavelet thresholding
         rec = wavelet_threshold(rec, wavelet=wavelet, level=level, lam=lam)
-        mses.append(mse_metric(rec, original))
 
+        # Ensure same shape as original
+        rec = rec[:original.shape[0], :original.shape[1]]
+
+        mses.append(mse_metric(rec, original))
         # Save iteration image
-        plt.imshow(rec, cmap='gray')
-        plt.title(f'Wavelet CS Iteration {i+1}')
-        plt.axis('off')
-        plt.savefig(f'{outdir}/iter_{i+1}.png', bbox_inches='tight')
-        plt.close()
+        plot_and_save(rec, f'Wavelet CS Iteration {i+1}', f'{outdir}/iter_{i+1}.png')
     return rec, mses
 
 def iterative_recon_tv(undersampled_k, mask, outdir, original, max_iter=50, lam=0.001, lr=0.1):
@@ -136,14 +185,13 @@ def iterative_recon_tv(undersampled_k, mask, outdir, original, max_iter=50, lam=
         # TV gradient step
         grad_tv = total_variation_gradient(rec)
         rec = rec - lr * lam * grad_tv
-        mses.append(mse_metric(rec, original))
 
+        # Ensure same shape
+        rec = rec[:original.shape[0], :original.shape[1]]
+
+        mses.append(mse_metric(rec, original))
         # Save iteration image
-        plt.imshow(rec, cmap='gray')
-        plt.title(f'TV CS Iteration {i+1}')
-        plt.axis('off')
-        plt.savefig(f'{outdir}/iter_{i+1}.png', bbox_inches='tight')
-        plt.close()
+        plot_and_save(rec, f'TV CS Iteration {i+1}', f'{outdir}/iter_{i+1}.png')
     return rec, mses
 
 # ============================================================
@@ -153,23 +201,9 @@ def iterative_recon_tv(undersampled_k, mask, outdir, original, max_iter=50, lam=
 def visualize_sampling_pattern(full_k_space, mask, outdir):
     sampled_k = full_k_space * mask
 
-    plt.imshow(np.log(1+np.abs(full_k_space)), cmap='gray')
-    plt.title('Full k-space (log magnitude)')
-    plt.axis('off')
-    plt.savefig(f'{outdir}/pattern_full_kspace.png', bbox_inches='tight')
-    plt.close()
-
-    plt.imshow(mask, cmap='gray')
-    plt.title('Sampling Mask')
-    plt.axis('off')
-    plt.savefig(f'{outdir}/pattern_mask.png', bbox_inches='tight')
-    plt.close()
-
-    plt.imshow(np.log(1+np.abs(sampled_k)), cmap='gray')
-    plt.title('Sampled k-space (log magnitude)')
-    plt.axis('off')
-    plt.savefig(f'{outdir}/pattern_sampled_kspace.png', bbox_inches='tight')
-    plt.close()
+    plot_and_save(np.log(1+np.abs(full_k_space)), 'Full k-space (log magnitude)', f'{outdir}/pattern_full_kspace.png')
+    plot_and_save(mask, 'Sampling Mask', f'{outdir}/pattern_mask.png')
+    plot_and_save(np.log(1+np.abs(sampled_k)), 'Sampled k-space (log magnitude)', f'{outdir}/pattern_sampled_kspace.png')
 
     # Create GIF
     images = []
@@ -181,30 +215,24 @@ def visualize_sampling_pattern(full_k_space, mask, outdir):
 # Main Demonstration
 # ============================================================
 
-mat_file_path = r"C:\Users\admin\Downloads\brain.mat"
-
-# Load the .mat file
-data = scipy.io.loadmat(mat_file_path)
-
 # Load original image
 image_size = 256
-#original_image = shepp_logan_phantom()
-original_image = np.abs(data['im'])
+original_image = shepp_logan_phantom()
 original_image = resize(original_image, (image_size, image_size), mode='reflect', anti_aliasing=True)
 
 # Full k-space (clean)
 full_k_space_clean = fft2c(original_image)
 
 # Add noise level
-# For demonstration, we add AWGN in k-space.
-noise_level = 0.000  # adjust as needed
-# Note: With noise added, reconstructions might be degraded.
+noise_level = 0.000
 
 sampling_methods = {
     'uniform': lambda sz: mask_uniform(sz, factor=4),
     'variable_density': lambda sz: mask_variable_density(sz, center_fraction=0.08, prob=0.3),
     'radial': lambda sz: mask_radial(sz, num_spokes=30),
-    'random_incoherent': lambda sz: mask_random_incoherent(sz, sampling_rate=0.3)
+    'random_incoherent': lambda sz: mask_random_incoherent(sz, sampling_rate=0.3),
+    'density_weighted': lambda sz: mask_density_weighted(sz, fraction=0.3),
+    'spiral': lambda sz: mask_spiral(sz, fraction=0.3)
 }
 
 recon_methods = {
@@ -216,50 +244,31 @@ recon_methods = {
 result_dir = 'results'
 ensure_dir(result_dir)
 
-# Save original image
-plt.imshow(original_image, cmap='gray')
-plt.title('Original Image')
-plt.axis('off')
-plt.savefig(f'{result_dir}/original_image.png', bbox_inches='tight')
-plt.close()
+plot_and_save(original_image, 'Original Image', f'{result_dir}/original_image.png')
 
-num_iterations = 50
-
-# We'll store final results in a structured manner for a table
-# Structure: results[(sampling_method, recon_method)] = { 'fraction_data': , 'MSE': , 'PSNR': , 'SSIM': }
+num_iterations = 100
 final_results = {}
 
-from skimage.metrics import structural_similarity as ssim
-
 for sm_name, sm_func in sampling_methods.items():
-    # Directory for this sampling method
     sm_dir = f'{result_dir}/{sm_name}'
     ensure_dir(sm_dir)
 
-    # Generate mask
     mask = sm_func(original_image.shape)
-    fraction_data = np.mean(mask)  # fraction of sampled points
+    fraction_data = np.mean(mask)
 
-    # Apply mask and add noise to k-space
     undersampled_k = full_k_space_clean * mask
-    # Add Gaussian noise
+    # Add Gaussian noise in k-space
     noise = (np.random.randn(*undersampled_k.shape) + 1j*np.random.randn(*undersampled_k.shape)) * noise_level * np.max(np.abs(full_k_space_clean))
     undersampled_k_noisy = undersampled_k + noise
 
-    # Visualize sampling pattern
     visualize_sampling_pattern(full_k_space_clean, mask, sm_dir)
 
     for rm_name, rm_func in recon_methods.items():
         outdir = f'{sm_dir}/{rm_name}'
         ensure_dir(outdir)
 
-        # Zero-filled baseline
         zero_filled_recon = reconstruct_zero_filled(undersampled_k_noisy, mask)
-        plt.imshow(zero_filled_recon, cmap='gray')
-        plt.title(f'{sm_name} - {rm_name} Zero-filled Recon')
-        plt.axis('off')
-        plt.savefig(f'{outdir}/zero_filled_recon.png', bbox_inches='tight')
-        plt.close()
+        plot_and_save(zero_filled_recon, f'{sm_name} - {rm_name} Zero-filled Recon', f'{outdir}/zero_filled_recon.png')
 
         if rm_name == 'zero_filled':
             final_rec = zero_filled_recon
@@ -272,12 +281,7 @@ for sm_name, sm_func in sampling_methods.items():
             final_rec = zero_filled_recon
             mses = []
 
-        # Save final reconstruction
-        plt.imshow(final_rec, cmap='gray')
-        plt.title(f'Final Reconstruction ({sm_name}, {rm_name})')
-        plt.axis('off')
-        plt.savefig(f'{outdir}/final_recon.png', bbox_inches='tight')
-        plt.close()
+        plot_and_save(final_rec, f'Final Reconstruction ({sm_name}, {rm_name})', f'{outdir}/final_recon.png')
 
         # If iterative, create GIF and plot MSE
         if rm_name in ['cs_wavelet', 'cs_tv']:
@@ -288,16 +292,16 @@ for sm_name, sm_func in sampling_methods.items():
                     images.append(imageio.imread(fname))
             imageio.mimsave(f'{outdir}/iterations.gif', images, fps=5)
 
-            # Plot MSE over iterations
+            # Plot MSE
+            fig = plt.figure(figsize=(6,6))
             plt.plot(range(1, len(mses)+1), mses, marker='o')
             plt.xlabel('Iteration')
             plt.ylabel('MSE')
             plt.title(f'MSE over Iterations ({sm_name}, {rm_name})')
             plt.grid(True)
-            plt.savefig(f'{outdir}/mse_plot.png', bbox_inches='tight')
-            plt.close()
+            plt.savefig(f'{outdir}/mse_plot.png')
+            plt.close(fig)
 
-        # Compute final metrics
         final_mse = mse_metric(final_rec, original_image)
         final_psnr = psnr_metric(final_rec, original_image)
         final_ssim = ssim(final_rec, original_image, data_range=final_rec.max()-final_rec.min())
@@ -321,8 +325,8 @@ for sm_name in sampling_methods.keys():
             axes[idx].set_title(f'{rm_name}')
         axes[idx].axis('off')
     plt.suptitle(f"Sampling: {sm_name}")
-    plt.savefig(f'{result_dir}/{sm_name}_comparison.png', bbox_inches='tight')
-    plt.close()
+    plt.savefig(f'{result_dir}/{sm_name}_comparison.png')
+    plt.close(fig)
 
 # Compare sampling patterns for each reconstruction method
 for rm_name in recon_methods.keys():
@@ -336,14 +340,12 @@ for rm_name in recon_methods.keys():
             axes[idx].set_title(f'{sm_name}')
         axes[idx].axis('off')
     plt.suptitle(f"Reconstruction: {rm_name}")
-    plt.savefig(f'{result_dir}/{rm_name}_comparison.png', bbox_inches='tight')
-    plt.close()
+    plt.savefig(f'{result_dir}/{rm_name}_comparison.png')
+    plt.close(fig)
 
 # ============================================================
 # Create a Results Table
 # ============================================================
-# We create a table that shows fraction_data, MSE, PSNR, SSIM for each combo
-
 sampling_list = list(sampling_methods.keys())
 recon_list = list(recon_methods.keys())
 
@@ -360,12 +362,11 @@ for sm_name in sampling_list:
             row.append("N/A")
     rows.append(row)
 
-# Print table as text
 print("Final Results Table (Fraction of Data, MSE, PSNR, SSIM):")
 col_widths = [max(len(r[i]) for r in ([table_header]+rows)) for i in range(len(table_header))]
 format_str = " | ".join(["{{:<{}}}".format(w) for w in col_widths])
 print(format_str.format(*table_header))
-print("-"*sum(col_widths) + "-"*(3*(len(table_header)-1)))
+print("-"*(sum(col_widths) + 3*(len(table_header)-1)))
 for row in rows:
     print(format_str.format(*row))
 
