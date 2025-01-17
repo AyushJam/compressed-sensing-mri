@@ -9,9 +9,9 @@ import imageio
 import os
 import shutil
 
-# ============================================================
+# ==================================
 # Utility Functions
-# ============================================================
+# ==================================
 
 def ensure_dir(path):
     if os.path.exists(path):
@@ -19,17 +19,24 @@ def ensure_dir(path):
     os.makedirs(path)
 
 def fft2c(img):
+    # centered fft
     return fftshift(fft2(img))
 
 def ifft2c(ksp):
     return ifft2(ifftshift(ksp))
 
 def soft_threshold(x, threshold):
+    # remove (abs) values below threshold
+    # if absolute value is < threshold, set it to zero
+    # replace the sign
     return np.sign(x)*np.maximum(np.abs(x)-threshold,0)
 
 def wavelet_threshold(img, wavelet='db4', level=4, lam=0.01):
+    # db4 is a type of wavelet like haar
     coeffs = pywt.wavedec2(img, wavelet=wavelet, level=level)
     thresh_coeffs = []
+
+    # threshold wavelet coefficients
     for c in coeffs:
         if isinstance(c, tuple):
             thresh_coeffs.append(tuple(soft_threshold(ci, lam) for ci in c))
@@ -39,6 +46,7 @@ def wavelet_threshold(img, wavelet='db4', level=4, lam=0.01):
     return rec
 
 def total_variation_gradient(img):
+    # vectorized image gradients
     dx = np.roll(img, -1, axis=1) - img
     dy = np.roll(img, -1, axis=0) - img
     dx_t = dx - np.roll(dx, 1, axis=1)
@@ -65,11 +73,12 @@ def plot_and_save(img, title, path):
     plt.savefig(path)
     plt.close(fig)
 
-# ============================================================
+# ============================
 # Sampling Masks
-# ============================================================
+# ============================
 
 def mask_uniform(size, factor=4):
+    # keep every factor_th point
     mask = np.zeros(size)
     mask[::factor, :] = 1
     return mask
@@ -86,6 +95,7 @@ def mask_variable_density(size, center_fraction=0.08, prob=0.3):
     return mask.astype(float)
 
 def mask_radial(size, num_spokes=30):
+    # retain points along radial spokes
     Ny, Nx = size
     mask = np.zeros(size)
     center = (Ny//2, Nx//2)
@@ -101,12 +111,14 @@ def mask_radial(size, num_spokes=30):
     return mask
 
 def mask_random_incoherent(size, sampling_rate=0.3):
+    # random sampling - should create noise-like artifacts
     Ny, Nx = size
     mask = (np.random.rand(Ny, Nx) < sampling_rate).astype(float)
     return mask
 
 def mask_density_weighted(size, fraction=0.3):
     # Density weighted: use a Gaussian centered at the center of k-space
+    # still random but retain more low frequency points
     Ny, Nx = size
     y, x = np.indices((Ny, Nx))
     cy, cx = Ny//2, Nx//2
@@ -151,6 +163,7 @@ def mask_spiral(size, fraction=0.3):
 # ============================================================
 
 def reconstruct_zero_filled(undersampled_k, mask):
+    # reconstruct with zeros for missing points
     return np.abs(ifft2c(undersampled_k))
 
 def iterative_recon_wavelet(undersampled_k, mask, outdir, original, max_iter=50, lam=0.01, wavelet='db4', level=4):
@@ -159,6 +172,7 @@ def iterative_recon_wavelet(undersampled_k, mask, outdir, original, max_iter=50,
     for i in range(max_iter):
         # Data consistency
         ksp_rec = fft2c(rec)
+        # enforce known points in the reconstruction
         ksp_rec = undersampled_k + (1 - mask)*ksp_rec
         rec = np.abs(ifft2c(ksp_rec))
 
@@ -179,6 +193,7 @@ def iterative_recon_tv(undersampled_k, mask, outdir, original, max_iter=50, lam=
     for i in range(max_iter):
         # Data consistency
         ksp_rec = fft2c(rec)
+        # measured points are ground truth - enforce
         ksp_rec = undersampled_k + (1 - mask)*ksp_rec
         rec = np.abs(ifft2c(ksp_rec))
 
